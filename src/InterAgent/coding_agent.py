@@ -82,7 +82,8 @@ class CodingAgent:
         data_structure_info: str,
         submission_file_name: str,
         workspace_dir: str,
-        device_info: Optional[Dict] = None
+        device_info: Optional[Dict] = None,
+        data_loader_info: Optional[str] = None
     ) -> Dict[str, str]:
         """
         生成研究代码(research.py)，实现完整的ML pipeline
@@ -95,6 +96,7 @@ class CodingAgent:
             submission_file_name: 提交文件名
             workspace_dir: 工作目录
             device_info: 设备信息（GPU/CPU配置）
+            data_loader_info: load_research_data函数的接口信息
 
         Returns:
             Dict包含生成的文件路径和状态信息
@@ -105,7 +107,8 @@ class CodingAgent:
             # 构建研究代码生成prompt
             prompt = self._build_research_generation_prompt(
                 research_topic, research_goal, init_analysis,
-                data_structure_info, submission_file_name, device_info
+                data_structure_info, submission_file_name, device_info,
+                data_loader_info
             )
             
             # 调用LLM生成代码
@@ -448,7 +451,8 @@ class CodingAgent:
         init_analysis: str,
         data_structure_info: str,
         submission_file_name: str,
-        device_info: Optional[Dict] = None
+        device_info: Optional[Dict] = None,
+        data_loader_info: Optional[str] = None
     ) -> str:
         """构建研究代码生成的prompt"""
         if device_info is None:
@@ -460,7 +464,8 @@ class CodingAgent:
             init_analysis=init_analysis,
             data_structure_info=data_structure_info,
             submission_file_name=submission_file_name,
-            device_info=device_info
+            device_info=device_info,
+            data_loader_info=data_loader_info
         )
 
     def _build_debug_prompt(

@@ -185,11 +185,17 @@ class MLEBenchEvaluator(EvaluatorAgent):
             评估结果
         """
         try:
+            # 尝试对齐列名（如果需要）
+            aligned_file = await self._align_submission_columns(submission_file, dataset_name)
+
+            # 如果对齐成功，使用对齐后的文件；否则使用原文件
+            file_to_evaluate = aligned_file if aligned_file else submission_file
+
             # 构建mlebench命令
             cmd = [
                 self.mlebench_command,
                 "grade-sample",
-                str(submission_file),
+                str(file_to_evaluate),
                 dataset_name
             ]
 
@@ -445,4 +451,183 @@ class MLEBenchEvaluator(EvaluatorAgent):
                         except json.JSONDecodeError:
                             break
 
+        return None
+
+    async def _align_submission_columns(
+        self,
+        submission_file: Path,
+        dataset_name: str
+    ) -> Optional[Path]:
+        """
+        尝试对齐submission文件的列名到标准格式
+
+        Args:
+            submission_file: 用户生成的提交文件
+            dataset_name: 数据集名称
+
+        Returns:
+            对齐后的临时文件路径，如果不需要对齐或对齐失败则返回None
+        """
+        try:
+            import pandas as pd
+            import tempfile
+
+            # 读取用户的submission文件
+            user_df = pd.read_csv(submission_file)
+            user_columns = set(user_df.columns)
+
+            self.logger.info(f"用户submission列名: {list(user_df.columns)}")
+
+            # 尝试从.cache中找到sample_submission文件
+            cache_base = Path.home() / "Desktop" / "InterAgentV2" / ".cache" / "mle-bench" / "data" / dataset_name / "prepared" / "public"
+
+            # 可能的sample submission文件名
+            possible_names = [
+                "sample_submission.csv",
+                f"{dataset_name}_sample_submission.csv"
+            ]
+
+            # 也可能在子目录中
+            sample_files = []
+            if cache_base.exists():
+                sample_files = list(cache_base.glob("*sample*submission*.csv"))
+
+            if not sample_files:
+                self.logger.info("未找到sample_submission文件，跳过列名对齐")
+                return None
+
+            # 读取标准格式
+            sample_file = sample_files[0]
+            self.logger.info(f"找到sample submission: {sample_file}")
+
+            standard_df = pd.read_csv(sample_file, nrows=5)  # 只读取前几行了解格式
+            standard_columns = list(standard_df.columns)
+
+            self.logger.info(f"标准列名: {standard_columns}")
+
+            # 检查是否需要对齐
+            if set(user_df.columns) == set(standard_columns):
+                self.logger.info("列名已匹配，无需对齐")
+                return None
+
+            # 尝试智能映射
+            aligned_df = self._try_align_columns(user_df, standard_columns)
+
+            if aligned_df is None:
+                self.logger.warning("无法智能对齐列名")
+                return None
+
+            # 创建临时文件保存对齐后的数据
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                suffix='.csv',
+                delete=False,
+                dir=submission_file.parent
+            ) as tmp_file:
+                aligned_df.to_csv(tmp_file.name, index=False)
+                tmp_path = Path(tmp_file.name)
+                self.logger.info(f"创建对齐后的临时文件: {tmp_path}")
+                self.logger.info(f"对齐后列名: {list(aligned_df.columns)}")
+                return tmp_path
+
+        except Exception as e:
+            self.logger.warning(f"列名对齐失败: {e}")
+            import traceback
+            self.logger.warning(traceback.format_exc())
+            return None
+
+    def _try_align_columns(
+        self,
+        user_df: 'pd.DataFrame',
+        standard_columns: List[str]
+    ) -> Optional['pd.DataFrame']:
+        """
+        尝试将用户DataFrame的列对齐到标准格式
+
+        Args:
+            user_df: 用户的DataFrame
+            standard_columns: 标准列名列表
+
+        Returns:
+            对齐后的DataFrame，如果无法对齐则返回None
+        """
+        import pandas as pd
+
+        user_columns = list(user_df.columns)
+        aligned_df = pd.DataFrame()
+
+        # 策略1: 直接重命名（大小写不敏感匹配）
+        column_mapping = {}
+        for std_col in standard_columns:
+            for user_col in user_columns:
+                if std_col.lower() == user_col.lower():
+                    column_mapping[user_col] = std_col
+                    break
+
+        if len(column_mapping) == len(standard_columns):
+            self.logger.info(f"使用策略1：直接重命名 {column_mapping}")
+            return user_df.rename(columns=column_mapping)[standard_columns]
+
+        # 策略2: 合成id列（如果标准是id列，用户有sentence_id和token_id）
+        if 'id' in standard_columns and 'id' not in user_columns:
+            # 检查是否有sentence_id和token_id
+            has_sentence_id = any('sentence' in col.lower() for col in user_columns)
+            has_token_id = any('token' in col.lower() for col in user_columns)
+
+            if has_sentence_id and has_token_id:
+                # 找到具体的列名
+                sentence_col = next((col for col in user_columns if 'sentence' in col.lower()), None)
+                token_col = next((col for col in user_columns if 'token' in col.lower()), None)
+
+                if sentence_col and token_col:
+                    self.logger.info(f"使用策略2：合成id列 ({sentence_col}_{token_col})")
+                    # 创建id列
+                    aligned_df['id'] = user_df[sentence_col].astype(str) + '_' + user_df[token_col].astype(str)
+
+                    # 映射其他列
+                    for std_col in standard_columns:
+                        if std_col == 'id':
+                            continue
+                        # 尝试找到匹配的列
+                        for user_col in user_columns:
+                            if std_col.lower() == user_col.lower():
+                                aligned_df[std_col] = user_df[user_col]
+                                break
+
+                    # 检查是否所有标准列都有了
+                    if set(aligned_df.columns) == set(standard_columns):
+                        return aligned_df[standard_columns]
+
+        # 策略3: 拆分id列（如果用户有id，标准需要sentence_id和token_id）
+        if 'id' in user_columns and 'id' not in standard_columns:
+            has_sentence_in_std = any('sentence' in col.lower() for col in standard_columns)
+            has_token_in_std = any('token' in col.lower() for col in standard_columns)
+
+            if has_sentence_in_std and has_token_in_std:
+                self.logger.info("使用策略3：拆分id列")
+                # 尝试拆分id
+                try:
+                    split_ids = user_df['id'].str.split('_', n=1, expand=True)
+                    sentence_col = next((col for col in standard_columns if 'sentence' in col.lower()), None)
+                    token_col = next((col for col in standard_columns if 'token' in col.lower()), None)
+
+                    if sentence_col and token_col:
+                        aligned_df[sentence_col] = split_ids[0]
+                        aligned_df[token_col] = split_ids[1]
+
+                        # 映射其他列
+                        for std_col in standard_columns:
+                            if 'sentence' in std_col.lower() or 'token' in std_col.lower():
+                                continue
+                            for user_col in user_columns:
+                                if std_col.lower() == user_col.lower():
+                                    aligned_df[std_col] = user_df[user_col]
+                                    break
+
+                        if set(aligned_df.columns) == set(standard_columns):
+                            return aligned_df[standard_columns]
+                except Exception as e:
+                    self.logger.warning(f"拆分id列失败: {e}")
+
+        self.logger.warning("所有对齐策略都失败")
         return None

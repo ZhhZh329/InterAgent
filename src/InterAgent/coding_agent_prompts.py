@@ -80,7 +80,8 @@ def build_research_code_generation_prompt(
     init_analysis: str,
     data_structure_info: str,
     submission_file_name: str,
-    device_info: dict
+    device_info: dict,
+    data_loader_info: str = None
 ) -> str:
     """构建研究代码生成的prompt
 
@@ -91,12 +92,24 @@ def build_research_code_generation_prompt(
         data_structure_info: 数据结构信息
         submission_file_name: 提交文件名
         device_info: 设备信息
+        data_loader_info: load_research_data函数的接口信息
 
     Returns:
         完整的prompt字符串
     """
     device_type = device_info.get('device_type', 'cpu')
     device_name = device_info.get('device_name', 'CPU')
+
+    # 构建data_loader_info部分
+    data_loader_section = ""
+    if data_loader_info:
+        data_loader_section = f"""
+
+**数据加载函数接口（必须使用）**:
+```python
+{data_loader_info}
+```
+"""
 
     return f"""你是一个专业的机器学习工程师，请根据以下信息生成完整的research.py代码。
 
@@ -109,22 +122,28 @@ def build_research_code_generation_prompt(
 
 **数据结构信息**:
 {data_structure_info}
-
+{data_loader_section}
 **提交文件名**: {submission_file_name}
 
 **计算设备**: {device_type} ({device_name})
 
 **代码要求**:
 
-1. **必须包含的部分**:
+1. **数据加载（必须严格遵守）**:
+   - **必须使用以下导入语句**：`from load_research_data import load_research_data`
+   - **必须调用此函数加载数据**：`train_df, test_df = load_research_data()`
+   - **严禁自己实现数据加载逻辑**（如pd.read_csv、寻找文件路径等）
+   - load_research_data函数已经处理好了所有路径和环境变量，直接使用即可
+   - 返回值是(train_df, test_df)两个pandas DataFrame
+
+2. **必须包含的其他部分**:
    - 导入必要的库
-   - 从load_research_data.py导入数据加载函数
    - 完整的数据预处理pipeline
    - 模型训练代码
    - 预测和结果保存
-   - 环境变量支持：USE_SMALL_SAMPLE和QUICK_TEST
+   - 环境变量支持：USE_SMALL_SAMPLE和QUICK_TEST（已在load_research_data中处理）
 
-2. **严禁使用任何Dummy/占位机制**:
+3. **严禁使用任何Dummy/占位机制**:
    * 绝对禁止使用sklearn.dummy.DummyClassifier、DummyRegressor等任何dummy模型
    * 绝对禁止使用random.choice()、np.random.random()等生成随机预测值
    * 绝对禁止使用固定常数（如全0、全1、均值）作为预测结果
@@ -132,18 +151,44 @@ def build_research_code_generation_prompt(
    * 绝对禁止在训练失败时fallback到dummy机制，训练失败就应该抛出异常
    * 必须使用真正的机器学习模型进行训练和预测，没有例外
 
-3. **严禁使用K折交叉验证**：
+4. **严禁使用K折交叉验证**：
    * 由于运行时间限制，禁止使用K折交叉验证（KFold, StratifiedKFold等）
    * 禁止使用cross_val_score、cross_validate等交叉验证函数
    * 如需验证集，使用简单的train_test_split一次性划分即可
    * 直接在训练集上训练模型，不要重复训练K次
 
-4. **设备优化**:
-   - 根据可用设备（{device_type}）选择合适的算法
-   - CPU环境：避免使用深度学习，优先sklearn模型
-   - GPU环境：可以使用PyTorch/TensorFlow
+5. **性能优化和加速策略（关键！）**:
 
-5. **环境变量支持**:
+   **当前设备：{device_type} ({device_name})**
+
+   **性能分析和优化思路**：
+   - 评估数据规模（行数、特征数、文件大小）和计算复杂度
+   - 识别潜在性能瓶颈：
+     * 串行处理 vs 并行处理的机会
+     * Python循环 vs 向量化操作
+     * 内存限制（是否需要增量/批处理）
+     * CPU vs GPU的适用性
+
+   **常见加速技术（根据场景选择）**：
+   - **并行化**：sklearn的n_jobs参数、multiprocessing、joblib等
+   - **向量化**：NumPy/Pandas向量化操作代替Python循环
+   - **GPU加速**：PyTorch/TensorFlow（注意sklearn/XGBoost不支持GPU）
+   - **增量学习**：大数据集使用partial_fit、mini-batch等避免OOM
+   - **算法选择**：根据数据规模选择合适复杂度的算法
+
+   **优化决策原则**：
+   - 小数据集：算法选择比加速更重要，基础优化即可
+   - 中大数据集：必须考虑并行化、向量化等加速手段
+   - 超大数据集：可能需要查找表、规则方法等内存高效方案
+   - 有GPU时：评估深度学习是否比传统ML更快
+
+   **自查问题**：
+   - 我选择的方法在当前数据规模下会慢吗？
+   - 是否有明显的性能瓶颈（循环、串行处理）？
+   - 如何利用多核CPU或GPU加速？
+   - 内存是否足够（是否需要批处理）？
+
+6. **环境变量支持**:
    ```python
    USE_SMALL_SAMPLE = os.getenv('USE_SMALL_SAMPLE', '0') == '1'
    QUICK_TEST = os.getenv('QUICK_TEST', '0') == '1'
@@ -157,12 +202,12 @@ def build_research_code_generation_prompt(
        ...
    ```
 
-6. **输出要求**:
+7. **输出要求**:
    - 生成{submission_file_name}文件
    - 格式必须符合提交要求
    - 包含所有测试集样本的预测结果
 
-7. **代码规范**:
+8. **代码规范**:
    - 完整的注释
    - 清晰的日志输出
    - 合理的异常处理

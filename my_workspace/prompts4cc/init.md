@@ -16,3 +16,4 @@
     2.  第二，规范问题。我想进一步让run_research_task的可读性更加完美，具体来说，我想让这个函数里面的内容像一个逻辑代码那样清晰易读，每个步骤都被打包成一个借口，我们读下来就想读伪代码一样清晰。如果你不确定修改的level那么请你跟我继续讨论
 11. 你觉得codingAgent有必要也改了吗？改成langgraph版本的？以及其他Agent有没有必要都改了？尤其是考虑后面要兼容memory之后？另外，我想把截止到现在版本的prompt都清理到代码外面增加可读性，比如InterAgent的每个prompt我都放在src/InterAgent/inter_agent_prompt.py里，然后在src/InterAgent/inter_agent.py用import导入进来，这样能增加可读性。
 12. ok，那我觉得还是有用的。好的现在main还能正常跑，在我们进入下一阶段之前，你再重新review一遍是否有些可读性不好的地方，有些臃肿的地方（只关注src/InterAgent下面的InterAgent和Coding Agent即可），我们现在的任务就是提高可读性，能简化的地方你也试试能不能简化好。
+13. ok，我已经备份好了，接下来我们在这个路径下面实现一个InterAgent的memory的代码，路径：src/InterAgent，并且存储路径是memory/{benchmark_name}/{level}

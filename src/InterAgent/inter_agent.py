@@ -186,6 +186,19 @@ class InterAgent:
         self.logger.info("=" * 80)
         self.logger.info("小样本测试通过，开始运行完整数据集...")
         self.logger.info("=" * 80)
+
+        # 清理小样本测试生成的CSV文件，避免干扰评估
+        workspace_dir = state['workspace_dir']
+        csv_files = list(workspace_dir.glob("*.csv"))
+        if csv_files:
+            self.logger.info(f"清理小样本测试生成的CSV文件: {[f.name for f in csv_files]}")
+            for csv_file in csv_files:
+                try:
+                    csv_file.unlink()
+                    self.logger.info(f"已删除: {csv_file.name}")
+                except Exception as e:
+                    self.logger.warning(f"删除文件失败 {csv_file.name}: {e}")
+
         full_run_result = await self._run_full_research_code(state['workspace_dir'])
         self.logger.info(f"完整数据集运行: {full_run_result['status']}")
         return {'full_run_result': full_run_result}
@@ -250,6 +263,143 @@ class InterAgent:
             'full_run_result': full_run_result
         }
 
+    async def node_regenerate_after_eval(self, state: ResearchState) -> ResearchState:
+        """节点: 评估失败后重新生成代码"""
+        evaluation_result = state['evaluation_result']
+        regeneration_count = state.get('regeneration_count', 0) + 1
+
+        self.logger.info("=" * 80)
+        self.logger.info(f"=== 第 {regeneration_count} 次重新生成research.py（评估失败）===")
+        self.logger.info(f"失败原因: {evaluation_result.get('error_message', '')}")
+        self.logger.info(f"失败类型: {evaluation_result.get('failure_type', '')}")
+        self.logger.info("=" * 80)
+
+        # 构建优化提示，包含评估错误信息
+        error_message = evaluation_result.get('error_message', '')
+        failure_type = evaluation_result.get('failure_type', '')
+
+        optimization_hint = f"""
+**评估失败，需要修复提交文件格式问题**：
+
+错误信息: {error_message}
+失败类型: {failure_type}
+
+请仔细检查并修复以下问题：
+1. 提交文件的列名是否正确（参考sample_submission文件）
+2. 提交文件的格式是否符合要求
+3. 是否包含所有必需的列
+4. 数据类型是否正确
+5. 是否有缺失值或格式错误
+
+重新生成代码时，请特别注意输出文件的格式规范。
+"""
+
+        # 重新生成代码，带上优化提示
+        optimized_init_analysis = state['init_analysis_result']['analysis_content'] + "\n\n**重要修复要求**：" + optimization_hint
+
+        # 获取data_structure_info（可能在不同的state key中）
+        data_structure_info = None
+        if 'research_test_result' in state and 'data_structure_info' in state['research_test_result']:
+            data_structure_info = state['research_test_result']['data_structure_info']
+        elif 'data_loader_test_result' in state and 'data_structure_info' in state['data_loader_test_result']:
+            data_structure_info = state['data_loader_test_result']['data_structure_info']
+
+        if not data_structure_info:
+            self.logger.error("无法找到data_structure_info，无法重新生成代码")
+            return {
+                'regeneration_count': regeneration_count,
+                'full_run_result': {
+                    'status': 'error',
+                    'message': '缺少data_structure_info，无法重新生成代码'
+                }
+            }
+
+        research_code_result = await self._generate_research_code(
+            research_topic=state['research_topic'],
+            research_goal=state['research_goal'],
+            init_analysis=optimized_init_analysis,
+            data_structure_info=data_structure_info,
+            submission_file_name=state['submission_file_name'],
+            workspace_dir=state['workspace_dir']
+        )
+
+        if research_code_result['status'] != 'success':
+            # 代码生成失败，直接返回失败状态
+            return {
+                'regeneration_count': regeneration_count,
+                'full_run_result': {
+                    'status': 'error',
+                    'message': f"代码生成失败: {research_code_result.get('message', '')}"
+                }
+            }
+
+        # 测试新代码（小样本）
+        research_test_result = await self._test_research_code(state['workspace_dir'])
+
+        if research_test_result['status'] == 'error':
+            # 小样本测试失败，启动debug流程
+            # 构造test_result字典（包含data_structure_info）
+            test_result_dict = {'data_structure_info': data_structure_info}
+
+            fix_result = await self._auto_fix_code_issues(
+                workspace_dir=state['workspace_dir'],
+                research_test_result=research_test_result,
+                research_topic=state['research_topic'],
+                research_goal=state['research_goal'],
+                init_analysis_result=state['init_analysis_result'],
+                test_result=test_result_dict,
+                submission_file_name=state['submission_file_name'],
+                current_regeneration_count=regeneration_count
+            )
+
+            research_test_result = fix_result['test_result']
+            regeneration_count = fix_result['regeneration_count']
+
+        if research_test_result['status'] != 'success':
+            # Debug后仍然失败
+            return {
+                'regeneration_count': regeneration_count,
+                'research_test_result': research_test_result,
+                'full_run_result': {
+                    'status': 'error',
+                    'message': '代码测试失败，无法继续'
+                }
+            }
+
+        # 清理小样本测试生成的CSV文件，避免干扰评估
+        workspace_dir = state['workspace_dir']
+        csv_files = list(workspace_dir.glob("*.csv"))
+        if csv_files:
+            self.logger.info(f"清理小样本测试生成的CSV文件: {[f.name for f in csv_files]}")
+            for csv_file in csv_files:
+                try:
+                    csv_file.unlink()
+                    self.logger.info(f"已删除: {csv_file.name}")
+                except Exception as e:
+                    self.logger.warning(f"删除文件失败 {csv_file.name}: {e}")
+
+        # 运行完整数据集
+        full_run_result = await self._run_full_research_code(state['workspace_dir'])
+
+        if full_run_result['status'] != 'success':
+            # 完整运行失败，可能需要进一步优化（会由route_after_full_run处理）
+            return {
+                'regeneration_count': regeneration_count,
+                'research_test_result': research_test_result,
+                'full_run_result': full_run_result
+            }
+
+        # 完整运行成功，继续评估
+        self.logger.info("=" * 80)
+        self.logger.info(f"=== 第 {regeneration_count} 次重新生成后完整运行成功 ===")
+        self.logger.info("=" * 80)
+
+        return {
+            'regeneration_count': regeneration_count,
+            'research_test_result': research_test_result,
+            'full_run_result': full_run_result
+        }
+
     # ===== Routing Functions =====
     # These determine which node to go to next
 
@@ -296,7 +446,18 @@ class InterAgent:
 
     def route_after_evaluate(self, state: ResearchState) -> str:
         """路由: 评估后"""
-        # 评估完成后结束（evaluation retry logic暂时简化，待未来扩展）
+        evaluation_result = state.get('evaluation_result', {})
+
+        # 检查是否需要重新生成代码
+        if evaluation_result.get('status') == 'error':
+            requires_regeneration = evaluation_result.get('requires_code_regeneration', False)
+
+            # 如果需要重新生成且还有重试机会
+            if requires_regeneration and state.get('regeneration_count', 0) < 3:
+                self.logger.warning("评估失败，需要重新生成代码")
+                return "regenerate_after_eval"
+
+        # 评估成功或达到重试上限，结束
         return "end"
 
     def build_research_graph(self):
@@ -319,6 +480,7 @@ class InterAgent:
         graph.add_node("run_full_dataset", self.node_run_full_dataset)
         graph.add_node("optimize_full_run", self.node_optimize_full_run)
         graph.add_node("evaluate", self.node_evaluate)
+        graph.add_node("regenerate_after_eval", self.node_regenerate_after_eval)
 
         # 设置入口点
         graph.set_entry_point("setup")
@@ -405,7 +567,18 @@ class InterAgent:
             "evaluate",
             self.route_after_evaluate,
             {
+                "regenerate_after_eval": "regenerate_after_eval",
                 "end": END
+            }
+        )
+
+        # 条件边: 评估失败重新生成后
+        graph.add_conditional_edges(
+            "regenerate_after_eval",
+            self.route_after_full_run,  # 复用full_run的routing逻辑
+            {
+                "evaluate": "evaluate",
+                "optimize_full_run": "optimize_full_run"
             }
         )
 
@@ -1131,7 +1304,7 @@ class InterAgent:
     ) -> Dict[str, str]:
         """
         生成研究代码
-        
+
         Args:
             research_topic: 研究主题
             research_goal: 研究目标
@@ -1139,11 +1312,14 @@ class InterAgent:
             data_structure_info: 数据结构信息
             submission_file_name: 提交文件名
             workspace_dir: 工作目录
-            
+
         Returns:
             生成结果
         """
         try:
+            # 读取load_research_data.py的函数签名和文档
+            data_loader_info = self._extract_data_loader_interface(workspace_dir)
+
             result = await self.coding_agent.generate_research_code(
                 research_topic=research_topic,
                 research_goal=research_goal,
@@ -1151,10 +1327,11 @@ class InterAgent:
                 data_structure_info=data_structure_info,
                 submission_file_name=submission_file_name,
                 workspace_dir=str(workspace_dir),
-                device_info=self.device_info
+                device_info=self.device_info,
+                data_loader_info=data_loader_info  # 新增参数
             )
             return result
-            
+
         except Exception as e:
             self.logger.error(f"生成研究代码时出错: {str(e)}")
             return {
@@ -1162,6 +1339,80 @@ class InterAgent:
                 "error": str(e),
                 "message": f"生成研究代码失败: {str(e)}"
             }
+
+    def _extract_data_loader_interface(self, workspace_dir: Path) -> str:
+        """
+        提取load_research_data.py的函数签名和文档
+
+        Args:
+            workspace_dir: 工作目录
+
+        Returns:
+            函数接口信息的字符串
+        """
+        try:
+            data_loader_file = workspace_dir / "load_research_data.py"
+            if not data_loader_file.exists():
+                return "# load_research_data.py文件不存在"
+
+            with open(data_loader_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # 提取load_research_data函数的定义和文档字符串
+            import re
+            # 匹配函数定义到下一个函数或文件末尾
+            pattern = r'(def load_research_data\([^)]*\):.*?)(?=\ndef \w+|\nif __name__|$)'
+            match = re.search(pattern, content, re.DOTALL)
+
+            if match:
+                func_content = match.group(1).strip()
+                # 只保留函数签名和文档字符串，去掉实现细节
+                lines = func_content.split('\n')
+                result_lines = []
+                in_docstring = False
+                docstring_delimiter = None
+
+                for i, line in enumerate(lines):
+                    # 函数签名
+                    if i == 0 or (i == 1 and line.strip() == ''):
+                        result_lines.append(line)
+                        continue
+
+                    # 检测文档字符串开始
+                    if not in_docstring:
+                        stripped = line.strip()
+                        if stripped.startswith('"""') or stripped.startswith("'''"):
+                            in_docstring = True
+                            docstring_delimiter = stripped[:3]
+                            result_lines.append(line)
+                            # 检查是否是单行文档字符串
+                            if stripped.endswith(docstring_delimiter) and len(stripped) > 6:
+                                in_docstring = False
+                            continue
+
+                    # 在文档字符串内
+                    if in_docstring:
+                        result_lines.append(line)
+                        if docstring_delimiter in line and line.strip().endswith(docstring_delimiter):
+                            in_docstring = False
+                            result_lines.append("    # ... (implementation details omitted)")
+                            break
+                        continue
+
+                    # 如果没有文档字符串，只保留前几行作为示例
+                    if len(result_lines) > 10:
+                        result_lines.append("    # ... (implementation details omitted)")
+                        break
+
+                return '\n'.join(result_lines)
+            else:
+                # 如果没有匹配到，返回整个文件的前50行
+                lines = content.split('\n')[:50]
+                return '\n'.join(lines) + '\n# ... (rest of file omitted)'
+
+        except Exception as e:
+            self.logger.warning(f"提取load_research_data接口失败: {e}")
+            return f"# 无法提取load_research_data.py接口: {e}"
     
     def _execute_research_code(
         self,
