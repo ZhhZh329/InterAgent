@@ -1,0 +1,784 @@
+import os
+import asyncio
+import logging
+from typing import Dict, List, Optional, Union
+from pathlib import Path
+from src.utils.openai_client import get_client
+
+
+class CodingAgent:
+    """编程代理，负责代码生成、调试和性能优化"""
+    
+    def __init__(self, model_name: Optional[str] = None):
+        self.client = get_client(model_name)
+        self.logger = logging.getLogger(__name__)
+    
+    async def generate_load_data_code(
+        self,
+        requirements: str,
+        output_dir: str,
+        project_name: str = "generated_project",
+        language: str = "python",
+        framework: Optional[str] = None
+    ) -> Dict[str, str]:
+        """
+        生成数据加载代码
+        
+        Args:
+            requirements: 需求描述
+            output_dir: 输出目录
+            project_name: 项目名称
+            language: 编程语言
+            framework: 框架选择（如scikit-learn, pytorch等）
+        
+        Returns:
+            Dict包含生成的文件路径和状态信息
+        """
+        self.logger.info(f"开始生成数据加载代码: {project_name}")
+        
+        # 创建输出目录
+        project_path = Path(output_dir) / project_name
+        project_path.mkdir(parents=True, exist_ok=True)
+        
+        # 构建代码生成prompt
+        prompt = self._build_generation_prompt(requirements, language, framework)
+        
+        try:
+            # 调用LLM生成代码
+            messages = [{"role": "user", "content": prompt}]
+            response = await self.client.chat(messages)
+            
+            # 解析并保存生成的代码文件
+            generated_files = await self._parse_and_save_code(response, project_path)
+            
+            self.logger.info(f"数据加载代码生成完成，共生成 {len(generated_files)} 个文件")
+            
+            return {
+                "status": "success",
+                "project_path": str(project_path),
+                "generated_files": generated_files,
+                "message": f"成功生成数据加载代码 {project_name}"
+            }
+            
+        except Exception as e:
+            self.logger.error(f"数据加载代码生成失败: {str(e)}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "message": f"数据加载代码生成失败: {str(e)}"
+            }
+    
+    async def generate_research_code(
+        self,
+        research_topic: str,
+        research_goal: str,
+        init_analysis: str,
+        data_structure_info: str,
+        submission_file_name: str,
+        workspace_dir: str,
+        device_info: Optional[Dict] = None
+    ) -> Dict[str, str]:
+        """
+        生成研究代码(research.py)，实现完整的ML pipeline
+
+        Args:
+            research_topic: 研究主题
+            research_goal: 研究目标
+            init_analysis: 初步分析结果
+            data_structure_info: 数据结构信息
+            submission_file_name: 提交文件名
+            workspace_dir: 工作目录
+            device_info: 设备信息（GPU/CPU配置）
+
+        Returns:
+            Dict包含生成的文件路径和状态信息
+        """
+        self.logger.info("开始生成研究代码...")
+
+        try:
+            # 构建研究代码生成prompt
+            prompt = self._build_research_generation_prompt(
+                research_topic, research_goal, init_analysis,
+                data_structure_info, submission_file_name, device_info
+            )
+            
+            # 调用LLM生成代码
+            messages = [{"role": "user", "content": prompt}]
+            response = await self.client.chat(messages, max_tokens=6000)
+            
+            # 提取代码并保存到research.py
+            research_code = self._extract_code_from_response(response)
+            research_file = Path(workspace_dir) / "research.py"
+            
+            with open(research_file, 'w', encoding='utf-8') as f:
+                f.write(research_code)
+            
+            self.logger.info(f"研究代码生成完成: {research_file}")
+            
+            return {
+                "status": "success",
+                "generated_file": str(research_file),
+                "message": "研究代码生成成功"
+            }
+            
+        except Exception as e:
+            self.logger.error(f"研究代码生成失败: {str(e)}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "message": f"研究代码生成失败: {str(e)}"
+            }
+    
+    async def install_missing_package(
+        self,
+        error_message: str,
+        project_root: str = "/Users/zhzhou/Desktop/InterAgentV2"
+    ) -> Dict[str, str]:
+        """
+        根据ModuleNotFoundError自动安装缺失的包
+
+        Args:
+            error_message: 错误信息
+            project_root: 项目根目录
+
+        Returns:
+            Dict包含安装结果和状态信息
+        """
+        self.logger.info("检测到ModuleNotFoundError，开始分析缺失的包...")
+
+        try:
+            # 使用LLM分析需要安装的包
+            prompt = f"""你是一个Python包管理专家。请分析以下ModuleNotFoundError错误信息，确定需要安装的正确包名。
+
+**错误信息：**
+{error_message}
+
+**任务要求：**
+1. 识别缺失的模块名（import语句中的名称）
+2. 确定对应的PyPI包名（可能与模块名不同）
+3. 返回纯JSON格式，格式如下：
+
+{{
+    "missing_module": "<缺失的模块名>",
+    "package_name": "<需要安装的包名>",
+    "reasoning": "<为什么是这个包名的简短说明>"
+}}
+
+**常见映射示例：**
+- import cv2 → opencv-python
+- import PIL → Pillow
+- import sklearn → scikit-learn
+- import yaml → PyYAML
+- import dotenv → python-dotenv
+
+只返回JSON，不要有其他文字。"""
+
+            messages = [{"role": "user", "content": prompt}]
+            response = await self.client.chat(messages, max_tokens=500)
+
+            # 解析LLM返回的包名
+            import json
+            import re
+
+            # 多种方式提取JSON
+            package_info = None
+            try:
+                package_info = json.loads(response.strip())
+            except json.JSONDecodeError:
+                # 尝试提取```json...```
+                json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
+                if json_match:
+                    package_info = json.loads(json_match.group(1))
+                else:
+                    # 尝试查找第一个JSON对象
+                    brace_start = response.find('{')
+                    if brace_start != -1:
+                        brace_count = 0
+                        for i in range(brace_start, len(response)):
+                            if response[i] == '{':
+                                brace_count += 1
+                            elif response[i] == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    package_info = json.loads(response[brace_start:i+1])
+                                    break
+
+            if not package_info or 'package_name' not in package_info:
+                return {
+                    "status": "error",
+                    "error": "无法解析LLM返回的包名信息",
+                    "message": f"LLM返回: {response}"
+                }
+
+            package_name = package_info['package_name']
+            missing_module = package_info.get('missing_module', 'unknown')
+            reasoning = package_info.get('reasoning', '')
+
+            self.logger.info(f"缺失模块: {missing_module}")
+            self.logger.info(f"需要安装的包: {package_name}")
+            self.logger.info(f"原因: {reasoning}")
+
+            # 使用uv add安装包
+            import subprocess
+            cmd = ["uv", "add", package_name]
+
+            self.logger.info(f"执行安装命令: {' '.join(cmd)}")
+            self.logger.info(f"工作目录: {project_root}")
+
+            result = subprocess.run(
+                cmd,
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5分钟超时
+            )
+
+            if result.returncode == 0:
+                self.logger.info(f"成功安装包: {package_name}")
+                return {
+                    "status": "success",
+                    "package_name": package_name,
+                    "missing_module": missing_module,
+                    "message": f"成功安装 {package_name}",
+                    "stdout": result.stdout,
+                    "stderr": result.stderr
+                }
+            else:
+                self.logger.error(f"安装包失败: {package_name}")
+                self.logger.error(f"STDOUT: {result.stdout}")
+                self.logger.error(f"STDERR: {result.stderr}")
+                return {
+                    "status": "error",
+                    "package_name": package_name,
+                    "error": f"uv add 失败，退出码: {result.returncode}",
+                    "stdout": result.stdout,
+                    "stderr": result.stderr
+                }
+
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "error",
+                "error": "安装超时（超过5分钟）",
+                "message": "包安装时间过长"
+            }
+        except Exception as e:
+            self.logger.error(f"安装包时出错: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return {
+                "status": "error",
+                "error": str(e),
+                "message": f"安装失败: {str(e)}"
+            }
+
+    async def debug_code(
+        self,
+        code_path: str,
+        error_message: str,
+        error_context: Optional[str] = None
+    ) -> Dict[str, str]:
+        """
+        根据报错信息调试代码
+        
+        Args:
+            code_path: 代码文件路径
+            error_message: 错误信息
+            error_context: 错误上下文（可选）
+        
+        Returns:
+            Dict包含修复后的代码和状态信息
+        """
+        self.logger.info(f"开始调试代码: {code_path}")
+        
+        try:
+            # 读取原始代码
+            with open(code_path, 'r', encoding='utf-8') as f:
+                original_code = f.read()
+            
+            # 构建调试prompt
+            prompt = self._build_debug_prompt(original_code, error_message, error_context)
+            
+            # 调用LLM进行调试
+            messages = [{"role": "user", "content": prompt}]
+            response = await self.client.chat(messages)
+            
+            # 解析修复后的代码
+            fixed_code = self._extract_code_from_response(response)
+            
+            # 备份原文件
+            backup_path = f"{code_path}.backup"
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(original_code)
+            
+            # 保存修复后的代码
+            with open(code_path, 'w', encoding='utf-8') as f:
+                f.write(fixed_code)
+            
+            self.logger.info(f"代码调试完成: {code_path}")
+            
+            return {
+                "status": "success",
+                "original_code": original_code,
+                "fixed_code": fixed_code,
+                "backup_path": backup_path,
+                "message": "代码调试完成"
+            }
+            
+        except Exception as e:
+            self.logger.error(f"代码调试失败: {str(e)}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "message": f"代码调试失败: {str(e)}"
+            }
+    
+    async def optimize_performance(
+        self,
+        code_path: str,
+        optimization_strategy: str,
+        target_metrics: Optional[List[str]] = None
+    ) -> Dict[str, str]:
+        """
+        根据提升策略优化代码性能
+        
+        Args:
+            code_path: 代码文件路径
+            optimization_strategy: 优化策略描述
+            target_metrics: 目标优化指标列表
+        
+        Returns:
+            Dict包含优化后的代码和状态信息
+        """
+        self.logger.info(f"开始优化代码性能: {code_path}")
+        
+        try:
+            # 读取原始代码
+            with open(code_path, 'r', encoding='utf-8') as f:
+                original_code = f.read()
+            
+            # 构建优化prompt
+            prompt = self._build_optimization_prompt(
+                original_code, optimization_strategy, target_metrics
+            )
+            
+            # 调用LLM进行优化
+            messages = [{"role": "user", "content": prompt}]
+            response = await self.client.chat(messages)
+            
+            # 解析优化后的代码
+            optimized_code = self._extract_code_from_response(response)
+            
+            # 备份原文件
+            backup_path = f"{code_path}.backup"
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(original_code)
+            
+            # 保存优化后的代码
+            with open(code_path, 'w', encoding='utf-8') as f:
+                f.write(optimized_code)
+            
+            self.logger.info(f"代码性能优化完成: {code_path}")
+            
+            return {
+                "status": "success",
+                "original_code": original_code,
+                "optimized_code": optimized_code,
+                "backup_path": backup_path,
+                "optimization_strategy": optimization_strategy,
+                "message": "代码性能优化完成"
+            }
+            
+        except Exception as e:
+            self.logger.error(f"代码优化失败: {str(e)}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "message": f"代码优化失败: {str(e)}"
+            }
+    
+    def _build_generation_prompt(
+        self, 
+        requirements: str, 
+        language: str, 
+        framework: Optional[str]
+    ) -> str:
+        """构建代码生成的prompt"""
+        framework_info = f"使用{framework}框架，" if framework else ""
+        
+        prompt = f"""
+        请根据以下需求，用{language}语言{framework_info}生成完整的项目代码：
+
+        需求描述：
+        {requirements}
+
+        请按照以下要求生成代码：
+        1. 生成完整可运行的项目结构
+        2. 包含必要的依赖文件（如requirements.txt）
+        3. 代码要有良好的注释和文档
+        4. 遵循最佳实践和代码规范
+        5. 确保代码的可读性和可维护性
+
+        请按照以下格式输出：
+        ```文件名
+        文件内容
+        ```
+
+        每个文件用上述格式分开，确保输出的代码完整且可以直接运行。
+        """
+        return prompt
+    
+    def _build_research_generation_prompt(
+        self,
+        research_topic: str,
+        research_goal: str,
+        init_analysis: str,
+        data_structure_info: str,
+        submission_file_name: str,
+        device_info: Optional[Dict] = None
+    ) -> str:
+        """构建研究代码生成的prompt"""
+
+        # 构建设备配置信息
+        device_config = ""
+        if device_info:
+            device_type = device_info.get('device_type', 'cpu')
+            device_name = device_info.get('device_name', 'CPU')
+
+            if device_type == 'cuda':
+                device_config = f"""
+**GPU加速配置（NVIDIA CUDA）**:
+- 检测到NVIDIA GPU: {device_name}
+- **重要**: sklearn模型（RandomForest, LogisticRegression等）不支持GPU，只在CPU运行
+- **使用GPU加速**: 必须使用PyTorch或TensorFlow的神经网络模型
+- PyTorch GPU配置:
+  ```python
+  import torch
+  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+  model = YourModel().to(device)
+  data = data.to(device)
+  ```
+- **如果选择sklearn模型** (CPU运行，使用CPU多核加速):
+  * 使用 `n_jobs=-1` 参数启用多核并行: `RandomForestClassifier(n_jobs=-1)`
+  * XGBoost使用 `nthread=-1` 或 `n_jobs=-1`: `XGBClassifier(n_jobs=-1)`
+  * LightGBM使用 `n_jobs=-1`: `LGBMClassifier(n_jobs=-1)`
+  * 数据预处理并行化: 使用joblib或multiprocessing加速特征提取
+"""
+            elif device_type == 'mps':
+                device_config = f"""
+**GPU加速配置（Apple Silicon MPS）**:
+- 检测到Apple Silicon GPU: {device_name}
+- **重要**: sklearn模型（RandomForest, LogisticRegression, XGBoost等）不支持GPU，只在CPU运行
+- **使用GPU加速**: 必须使用PyTorch的神经网络模型（TensorFlow对MPS支持有限）
+- PyTorch MPS配置:
+  ```python
+  import torch
+  if torch.backends.mps.is_available():
+      device = torch.device('mps')
+  else:
+      device = torch.device('cpu')
+  model = YourModel().to(device)
+  data = data.to(device)
+  ```
+- **如果选择sklearn/XGBoost等传统ML库** (CPU运行，使用CPU多核加速):
+  * 使用 `n_jobs=-1` 启用所有CPU核心并行训练:
+    - `RandomForestClassifier(n_jobs=-1)`
+    - `XGBClassifier(n_jobs=-1)` 或 `nthread=-1`
+    - `LGBMClassifier(n_jobs=-1)`
+    - `LogisticRegression(n_jobs=-1)`
+  * 特征提取并行化: 使用joblib的Parallel和delayed进行多核特征工程
+  * 数据预处理: 使用pandas的apply配合multiprocessing加速
+  * Apple Silicon的CPU性能强大，充分利用多核可以获得很好的性能
+- 注意: MPS可能不支持所有PyTorch操作，需要fallback到CPU
+"""
+            else:
+                device_config = f"""
+**计算设备配置（CPU）**:
+- 未检测到GPU，使用CPU运行
+- **sklearn、XGBoost等传统ML库CPU加速方法**:
+  * 使用 `n_jobs=-1` 启用多核并行训练:
+    - `RandomForestClassifier(n_jobs=-1)`
+    - `XGBClassifier(n_jobs=-1)`
+    - `LGBMClassifier(n_jobs=-1)`
+    - `LogisticRegression(n_jobs=-1)` (solver='saga'/'sag'支持并行)
+  * 特征提取并行化: 使用joblib或multiprocessing
+  * 数据批处理: 对大数据集使用mini-batch处理
+- 如使用PyTorch: device = torch.device('cpu')
+"""
+
+        prompt = f"""
+        请根据以下信息生成一个完整的机器学习研究代码(research.py)，实现从数据加载到预测结果的完整pipeline：
+
+        **研究主题**:
+        {research_topic}
+
+        **研究目标**:
+        {research_goal}
+
+        {device_config}
+
+        **初步分析结果**:
+        {init_analysis}
+
+        **数据结构信息**:
+        {data_structure_info}
+
+        **MVP优先原则**:
+        - **目标**: 生成最简单、最容易调试成功的baseline代码
+        - **策略**: 根据初步分析的推荐方案选择合适的技术
+        - **模型选择准则**:
+          * **优先遵循初步分析的推荐**：如果初步分析明确推荐某种方法，必须严格遵循
+          * **大数据集特例**：对于大规模数据集（>100万行或文件>100MB），允许使用内存高效的方法（如基于内存的映射、缓存等），这是避免内存溢出的必要手段
+          * **小数据集要求**：对于小数据集，必须使用真正的ML/DL模型（sklearn、XGBoost、神经网络等）
+        - **原则**: 15分钟内能完成的简单实现，先跑通流程再优化
+
+        **要求**:
+        1. **文件名**: 必须是research.py，单文件包含所有代码
+        2. **数据加载**:
+           - 使用 `from load_research_data import load_research_data` 获取数据
+           - **重要**: 该函数返回2个值: `train_data, test_data = load_research_data()`
+           - train_data和test_data的具体结构由load_research_data.py定义，可能是:
+             * DataFrame格式: 直接pandas DataFrame
+             * 字典格式: 包含数据和元信息的字典结构
+             * 列表格式: 样本列表
+           - **必须**先检查返回数据的实际类型和结构，再编写处理代码
+           - 可以在代码开头打印数据类型和结构进行调试: `print(type(train_data), train_data.keys() if isinstance(train_data, dict) else train_data.shape)`
+        3. **完整Pipeline**: 包含数据预处理、模型训练、预测、评估
+        4. **输出结果**: 生成名为 `{submission_file_name}` 的提交文件
+        5. **代码结构**:
+           - 导入必要的库（pandas、numpy，根据方案选择sklearn或其他）
+           - 定义简单的数据预处理函数
+           - 根据初步分析推荐实现主要方法（内存高效方法/ML模型/深度学习）
+           - 主执行函数
+           - if __name__ == "__main__": 执行代码
+
+        **技术要求（MVP版本）**:
+        - **方法选择要求**:
+          * **严格遵循初步分析的推荐方案**
+          * 对于大数据集（>100万行），使用内存高效的方法
+          * 对于小数据集，使用ML/DL模型：sklearn模型(LogisticRegression, RandomForest, XGBoost等)或神经网络
+          * **内存安全优先**: 避免在大数据集上训练内存密集型模型（如RandomForest）
+        - 基于初步分析结果选择合适的模型和方法
+        - 包含适当的数据预处理和特征工程
+        - 实现模型训练和验证
+        - **严禁使用K折交叉验证**：
+          * 由于运行时间限制，禁止使用K折交叉验证（KFold, StratifiedKFold等）
+          * 禁止使用cross_val_score、cross_validate等交叉验证函数
+          * 如需验证集，使用简单的train_test_split一次性划分即可
+          * 直接在训练集上训练模型，不要重复训练K次
+        - 生成符合格式要求的预测结果，输出文件必须以.csv结尾（不要.csv.zip等）
+        - 添加适当的日志和错误处理
+        - 代码要能直接运行，无需额外配置
+        - **重要**: 支持环境变量QUICK_TEST=1时使用小样本数据快速验证，但必须真实运行完整ML pipeline（真实训练模型）
+        - **重要**: 使用最新的transformers库API，避免过时的导入（如AdamW应从torch.optim导入）
+        - **重要**: 在QUICK_TEST模式下，如果代码执行失败，绝对不要创建任何submission文件，直接抛出异常
+        - **严禁使用任何Dummy/占位机制**:
+          * 绝对禁止使用sklearn.dummy.DummyClassifier、DummyRegressor等任何dummy模型
+          * 绝对禁止使用random.choice()、np.random.random()等生成随机预测值
+          * 绝对禁止使用固定常数（如全0、全1、均值）作为预测结果
+          * 绝对禁止使用简单规则（if-else规则、阈值判断）代替真实ML模型
+          * 绝对禁止在训练失败时fallback到dummy机制，训练失败就应该抛出异常
+          * 必须使用真正的机器学习模型进行训练和预测，没有例外
+        - **严禁**: 不要添加任何fallback机制、容错逻辑、规则基线或备选方案，只能使用ML模型，失败就是失败
+        - **严禁**: 不要生成假的submission文件或虚拟数据，必须基于真实的模型预测结果
+        - **关键要求**: submission文件必须包含对测试集的真实预测结果，不能是空文件、占位符或虚假数据
+        - **验证要求**: 生成的submission.csv必须有正确的行数（与测试集匹配）和有意义的预测内容
+        - **关键要求-数据健壮性**: 数据中可能包含NaN/None值，所有处理函数必须能安全处理这些值
+          * 在特征提取、字符串操作、数值计算前，必须检查值是否为NaN
+          * 示例: `value = str(value) if pd.notna(value) else ''` 或 `if pd.isna(value): return default_value`
+          * 绝对不能让NaN值导致程序崩溃（如调用len()、split()等方法前必须检查）
+
+        **输出格式**:
+        ```python
+        # research.py的完整代码
+        ```
+
+        请确保代码完整、可运行，并能实现研究目标。代码应该是production-ready的质量。
+        """
+        return prompt
+    
+    def _build_debug_prompt(
+        self, 
+        code: str, 
+        error_message: str, 
+        error_context: Optional[str]
+    ) -> str:
+        """构建调试的prompt"""
+        context_info = f"\n\n错误上下文：\n{error_context}" if error_context else ""
+        
+        prompt = f"""
+        以下代码出现了错误，请帮助分析和修复：
+
+        原始代码：
+        ```python
+        {code}
+        ```
+
+        错误信息：
+        {error_message}{context_info}
+
+        **重要提示 - load_research_data()的正确用法**:
+        - `load_research_data()`返回2个值: `train_data, test_data = load_research_data()`
+        - train_data和test_data的具体结构取决于数据集，可能是:
+          * DataFrame格式: pandas DataFrame对象
+          * 字典格式: 包含数据和元信息的字典
+          * 列表格式: 样本列表或其他自定义格式
+        - **必须**先检查数据的实际类型，然后根据实际结构编写代码
+        - 不要假设特定的数据结构（如特定的字典key或DataFrame列名）
+
+        **严禁使用Dummy机制**:
+        - 绝对禁止使用sklearn.dummy.DummyClassifier、DummyRegressor
+        - 绝对禁止使用random/np.random生成随机预测
+        - 绝对禁止使用固定常数（全0/全1/均值）作为预测
+        - 绝对禁止使用简单规则代替ML模型
+        - 训练失败必须抛出异常，不能fallback到dummy机制
+        - 必须使用真正的机器学习模型，没有例外
+
+        请：
+        1. 分析错误原因（特别注意是否正确处理了load_research_data的返回值）
+        2. 提供修复方案（不能使用任何dummy机制）
+        3. 输出修复后的完整代码
+
+        请按照以下格式输出修复后的代码：
+        ```python
+        修复后的完整代码
+        ```
+        """
+        return prompt
+    
+    def _build_optimization_prompt(
+        self, 
+        code: str, 
+        strategy: str, 
+        target_metrics: Optional[List[str]]
+    ) -> str:
+        """构建性能优化的prompt"""
+        metrics_info = ""
+        if target_metrics:
+            metrics_info = f"\n\n目标优化指标：{', '.join(target_metrics)}"
+        
+        prompt = f"""
+        请根据以下优化策略对代码进行性能优化：
+
+        原始代码：
+        ```python
+        {code}
+        ```
+
+        优化策略：
+        {strategy}{metrics_info}
+
+        请：
+        1. 分析代码的性能瓶颈
+        2. 根据优化策略进行改进
+        3. 保持代码功能不变的前提下提升性能
+        4. 添加必要的注释说明优化点
+
+        请按照以下格式输出优化后的代码：
+        ```python
+        优化后的完整代码
+        ```
+        """
+        return prompt
+    
+    async def _parse_and_save_code(self, response: str, project_path: Path) -> List[str]:
+        """解析LLM响应并保存代码文件"""
+        generated_files = []
+        
+        # 简单的代码块解析
+        lines = response.split('\n')
+        current_file = None
+        current_content = []
+        in_code_block = False
+        
+        for line in lines:
+            if line.startswith('```') and not in_code_block:
+                # 开始代码块
+                if current_file and current_content:
+                    # 保存前一个文件
+                    file_path = project_path / current_file
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(current_content))
+                    generated_files.append(str(file_path))
+                
+                # 提取文件名
+                current_file = line[3:].strip()
+                if not current_file:
+                    current_file = "main.py"  # 默认文件名
+                current_content = []
+                in_code_block = True
+                
+            elif line.startswith('```') and in_code_block:
+                # 结束代码块
+                in_code_block = False
+                
+            elif in_code_block:
+                # 代码内容
+                current_content.append(line)
+        
+        # 保存最后一个文件
+        if current_file and current_content:
+            file_path = project_path / current_file
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(current_content))
+            generated_files.append(str(file_path))
+        
+        return generated_files
+    
+    def _extract_code_from_response(self, response: str) -> str:
+        """从LLM响应中提取代码"""
+        # 查找代码块
+        lines = response.split('\n')
+        code_lines = []
+        in_code_block = False
+        
+        for line in lines:
+            if line.startswith('```'):
+                if in_code_block:
+                    break  # 结束代码块
+                else:
+                    in_code_block = True  # 开始代码块
+                    continue
+            
+            if in_code_block:
+                code_lines.append(line)
+        
+        if not code_lines:
+            # 如果没有找到代码块，返回整个响应
+            return response.strip()
+        
+        return '\n'.join(code_lines)
+
+
+# 便捷函数
+async def generate_load_data_project(
+    requirements: str,
+    output_dir: str,
+    project_name: str = "generated_project",
+    language: str = "python",
+    framework: Optional[str] = None
+) -> Dict[str, str]:
+    """生成数据加载代码项目的便捷函数"""
+    agent = CodingAgent()
+    return await agent.generate_load_data_code(requirements, output_dir, project_name, language, framework)
+
+
+async def debug_code_file(
+    code_path: str,
+    error_message: str,
+    error_context: Optional[str] = None
+) -> Dict[str, str]:
+    """调试代码文件的便捷函数"""
+    agent = CodingAgent()
+    return await agent.debug_code(code_path, error_message, error_context)
+
+
+async def optimize_code_performance(
+    code_path: str,
+    optimization_strategy: str,
+    target_metrics: Optional[List[str]] = None
+) -> Dict[str, str]:
+    """优化代码性能的便捷函数"""
+    agent = CodingAgent()
+    return await agent.optimize_performance(code_path, optimization_strategy, target_metrics)
