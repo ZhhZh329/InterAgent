@@ -159,7 +159,31 @@ class CodingAgent:
             response = await self.client.chat(messages, max_tokens=500)
 
             # 解析LLM返回的包名
-            package_info = self._parse_json_response(response)
+            import json
+            import re
+
+            # 多种方式提取JSON
+            package_info = None
+            try:
+                package_info = json.loads(response.strip())
+            except json.JSONDecodeError:
+                # 尝试提取```json...```
+                json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
+                if json_match:
+                    package_info = json.loads(json_match.group(1))
+                else:
+                    # 尝试查找第一个JSON对象
+                    brace_start = response.find('{')
+                    if brace_start != -1:
+                        brace_count = 0
+                        for i in range(brace_start, len(response)):
+                            if response[i] == '{':
+                                brace_count += 1
+                            elif response[i] == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    package_info = json.loads(response[brace_start:i+1])
+                                    break
 
             if not package_info or 'package_name' not in package_info:
                 return {
@@ -262,10 +286,12 @@ class CodingAgent:
             
             # 解析修复后的代码
             fixed_code = self._extract_code_from_response(response)
-
+            
             # 备份原文件
-            backup_path = self._backup_file(code_path)
-
+            backup_path = f"{code_path}.backup"
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(original_code)
+            
             # 保存修复后的代码
             with open(code_path, 'w', encoding='utf-8') as f:
                 f.write(fixed_code)
@@ -323,10 +349,12 @@ class CodingAgent:
             
             # 解析优化后的代码
             optimized_code = self._extract_code_from_response(response)
-
+            
             # 备份原文件
-            backup_path = self._backup_file(code_path)
-
+            backup_path = f"{code_path}.backup"
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(original_code)
+            
             # 保存优化后的代码
             with open(code_path, 'w', encoding='utf-8') as f:
                 f.write(optimized_code)
@@ -350,70 +378,10 @@ class CodingAgent:
                 "message": f"代码优化失败: {str(e)}"
             }
     
-    def _parse_json_response(self, response: str) -> Optional[Dict]:
-        """从LLM响应中解析JSON，支持多种格式
-
-        Args:
-            response: LLM响应文本
-
-        Returns:
-            解析后的JSON对象，失败返回None
-        """
-        import json
-        import re
-
-        # 方式1: 直接解析
-        try:
-            return json.loads(response.strip())
-        except json.JSONDecodeError:
-            pass
-
-        # 方式2: 提取```json...```代码块
-        json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
-
-        # 方式3: 查找第一个完整的JSON对象
-        brace_start = response.find('{')
-        if brace_start != -1:
-            brace_count = 0
-            for i in range(brace_start, len(response)):
-                if response[i] == '{':
-                    brace_count += 1
-                elif response[i] == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        try:
-                            return json.loads(response[brace_start:i+1])
-                        except json.JSONDecodeError:
-                            pass
-                        break
-
-        return None
-
-    def _backup_file(self, file_path: str) -> str:
-        """备份文件
-
-        Args:
-            file_path: 要备份的文件路径
-
-        Returns:
-            备份文件路径
-        """
-        backup_path = f"{file_path}.backup"
-        with open(file_path, 'r', encoding='utf-8') as f:
-            original_content = f.read()
-        with open(backup_path, 'w', encoding='utf-8') as f:
-            f.write(original_content)
-        return backup_path
-
     def _build_generation_prompt(
-        self,
-        requirements: str,
-        language: str,
+        self, 
+        requirements: str, 
+        language: str, 
         framework: Optional[str]
     ) -> str:
         """构建代码生成的prompt"""
@@ -463,6 +431,175 @@ class CodingAgent:
             device_info=device_info
         )
 
+    def _build_research_generation_prompt_OLD(
+        self,
+        research_topic: str,
+        research_goal: str,
+        init_analysis: str,
+        data_structure_info: str,
+        submission_file_name: str,
+        device_info: Optional[Dict] = None
+    ) -> str:
+        """构建研究代码生成的prompt（保留原实现作为参考）"""
+
+        # 构建设备配置信息
+        device_config = ""
+        if device_info:
+            device_type = device_info.get('device_type', 'cpu')
+            device_name = device_info.get('device_name', 'CPU')
+
+            if device_type == 'cuda':
+                device_config = f"""
+**GPU加速配置（NVIDIA CUDA）**:
+- 检测到NVIDIA GPU: {device_name}
+- **重要**: sklearn模型（RandomForest, LogisticRegression等）不支持GPU，只在CPU运行
+- **使用GPU加速**: 必须使用PyTorch或TensorFlow的神经网络模型
+- PyTorch GPU配置:
+  ```python
+  import torch
+  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+  model = YourModel().to(device)
+  data = data.to(device)
+  ```
+- **如果选择sklearn模型** (CPU运行，使用CPU多核加速):
+  * 使用 `n_jobs=-1` 参数启用多核并行: `RandomForestClassifier(n_jobs=-1)`
+  * XGBoost使用 `nthread=-1` 或 `n_jobs=-1`: `XGBClassifier(n_jobs=-1)`
+  * LightGBM使用 `n_jobs=-1`: `LGBMClassifier(n_jobs=-1)`
+  * 数据预处理并行化: 使用joblib或multiprocessing加速特征提取
+"""
+            elif device_type == 'mps':
+                device_config = f"""
+**GPU加速配置（Apple Silicon MPS）**:
+- 检测到Apple Silicon GPU: {device_name}
+- **重要**: sklearn模型（RandomForest, LogisticRegression, XGBoost等）不支持GPU，只在CPU运行
+- **使用GPU加速**: 必须使用PyTorch的神经网络模型（TensorFlow对MPS支持有限）
+- PyTorch MPS配置:
+  ```python
+  import torch
+  if torch.backends.mps.is_available():
+      device = torch.device('mps')
+  else:
+      device = torch.device('cpu')
+  model = YourModel().to(device)
+  data = data.to(device)
+  ```
+- **如果选择sklearn/XGBoost等传统ML库** (CPU运行，使用CPU多核加速):
+  * 使用 `n_jobs=-1` 启用所有CPU核心并行训练:
+    - `RandomForestClassifier(n_jobs=-1)`
+    - `XGBClassifier(n_jobs=-1)` 或 `nthread=-1`
+    - `LGBMClassifier(n_jobs=-1)`
+    - `LogisticRegression(n_jobs=-1)`
+  * 特征提取并行化: 使用joblib的Parallel和delayed进行多核特征工程
+  * 数据预处理: 使用pandas的apply配合multiprocessing加速
+  * Apple Silicon的CPU性能强大，充分利用多核可以获得很好的性能
+- 注意: MPS可能不支持所有PyTorch操作，需要fallback到CPU
+"""
+            else:
+                device_config = f"""
+**计算设备配置（CPU）**:
+- 未检测到GPU，使用CPU运行
+- **sklearn、XGBoost等传统ML库CPU加速方法**:
+  * 使用 `n_jobs=-1` 启用多核并行训练:
+    - `RandomForestClassifier(n_jobs=-1)`
+    - `XGBClassifier(n_jobs=-1)`
+    - `LGBMClassifier(n_jobs=-1)`
+    - `LogisticRegression(n_jobs=-1)` (solver='saga'/'sag'支持并行)
+  * 特征提取并行化: 使用joblib或multiprocessing
+  * 数据批处理: 对大数据集使用mini-batch处理
+- 如使用PyTorch: device = torch.device('cpu')
+"""
+
+        prompt = f"""
+        请根据以下信息生成一个完整的机器学习研究代码(research.py)，实现从数据加载到预测结果的完整pipeline：
+
+        **研究主题**:
+        {research_topic}
+
+        **研究目标**:
+        {research_goal}
+
+        {device_config}
+
+        **初步分析结果**:
+        {init_analysis}
+
+        **数据结构信息**:
+        {data_structure_info}
+
+        **MVP优先原则**:
+        - **目标**: 生成最简单、最容易调试成功的baseline代码
+        - **策略**: 根据初步分析的推荐方案选择合适的技术
+        - **模型选择准则**:
+          * **优先遵循初步分析的推荐**：如果初步分析明确推荐某种方法，必须严格遵循
+          * **大数据集特例**：对于大规模数据集（>100万行或文件>100MB），允许使用内存高效的方法（如基于内存的映射、缓存等），这是避免内存溢出的必要手段
+          * **小数据集要求**：对于小数据集，必须使用真正的ML/DL模型（sklearn、XGBoost、神经网络等）
+        - **原则**: 15分钟内能完成的简单实现，先跑通流程再优化
+
+        **要求**:
+        1. **文件名**: 必须是research.py，单文件包含所有代码
+        2. **数据加载**:
+           - 使用 `from load_research_data import load_research_data` 获取数据
+           - **重要**: 该函数返回2个值: `train_data, test_data = load_research_data()`
+           - train_data和test_data的具体结构由load_research_data.py定义，可能是:
+             * DataFrame格式: 直接pandas DataFrame
+             * 字典格式: 包含数据和元信息的字典结构
+             * 列表格式: 样本列表
+           - **必须**先检查返回数据的实际类型和结构，再编写处理代码
+           - 可以在代码开头打印数据类型和结构进行调试: `print(type(train_data), train_data.keys() if isinstance(train_data, dict) else train_data.shape)`
+        3. **完整Pipeline**: 包含数据预处理、模型训练、预测、评估
+        4. **输出结果**: 生成名为 `{submission_file_name}` 的提交文件
+        5. **代码结构**:
+           - 导入必要的库（pandas、numpy，根据方案选择sklearn或其他）
+           - 定义简单的数据预处理函数
+           - 根据初步分析推荐实现主要方法（内存高效方法/ML模型/深度学习）
+           - 主执行函数
+           - if __name__ == "__main__": 执行代码
+
+        **技术要求（MVP版本）**:
+        - **方法选择要求**:
+          * **严格遵循初步分析的推荐方案**
+          * 对于大数据集（>100万行），使用内存高效的方法
+          * 对于小数据集，使用ML/DL模型：sklearn模型(LogisticRegression, RandomForest, XGBoost等)或神经网络
+          * **内存安全优先**: 避免在大数据集上训练内存密集型模型（如RandomForest）
+        - 基于初步分析结果选择合适的模型和方法
+        - 包含适当的数据预处理和特征工程
+        - 实现模型训练和验证
+        - **严禁使用K折交叉验证**：
+          * 由于运行时间限制，禁止使用K折交叉验证（KFold, StratifiedKFold等）
+          * 禁止使用cross_val_score、cross_validate等交叉验证函数
+          * 如需验证集，使用简单的train_test_split一次性划分即可
+          * 直接在训练集上训练模型，不要重复训练K次
+        - 生成符合格式要求的预测结果，输出文件必须以.csv结尾（不要.csv.zip等）
+        - 添加适当的日志和错误处理
+        - 代码要能直接运行，无需额外配置
+        - **重要**: 支持环境变量QUICK_TEST=1时使用小样本数据快速验证，但必须真实运行完整ML pipeline（真实训练模型）
+        - **重要**: 使用最新的transformers库API，避免过时的导入（如AdamW应从torch.optim导入）
+        - **重要**: 在QUICK_TEST模式下，如果代码执行失败，绝对不要创建任何submission文件，直接抛出异常
+        - **严禁使用任何Dummy/占位机制**:
+          * 绝对禁止使用sklearn.dummy.DummyClassifier、DummyRegressor等任何dummy模型
+          * 绝对禁止使用random.choice()、np.random.random()等生成随机预测值
+          * 绝对禁止使用固定常数（如全0、全1、均值）作为预测结果
+          * 绝对禁止使用简单规则（if-else规则、阈值判断）代替真实ML模型
+          * 绝对禁止在训练失败时fallback到dummy机制，训练失败就应该抛出异常
+          * 必须使用真正的机器学习模型进行训练和预测，没有例外
+        - **严禁**: 不要添加任何fallback机制、容错逻辑、规则基线或备选方案，只能使用ML模型，失败就是失败
+        - **严禁**: 不要生成假的submission文件或虚拟数据，必须基于真实的模型预测结果
+        - **关键要求**: submission文件必须包含对测试集的真实预测结果，不能是空文件、占位符或虚假数据
+        - **验证要求**: 生成的submission.csv必须有正确的行数（与测试集匹配）和有意义的预测内容
+        - **关键要求-数据健壮性**: 数据中可能包含NaN/None值，所有处理函数必须能安全处理这些值
+          * 在特征提取、字符串操作、数值计算前，必须检查值是否为NaN
+          * 示例: `value = str(value) if pd.notna(value) else ''` 或 `if pd.isna(value): return default_value`
+          * 绝对不能让NaN值导致程序崩溃（如调用len()、split()等方法前必须检查）
+
+        **输出格式**:
+        ```python
+        # research.py的完整代码
+        ```
+
+        请确保代码完整、可运行，并能实现研究目标。代码应该是production-ready的质量。
+        """
+        return prompt
+    
     def _build_debug_prompt(
         self,
         code: str,

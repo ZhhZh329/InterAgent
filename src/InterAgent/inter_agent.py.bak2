@@ -411,6 +411,450 @@ class InterAgent:
         # 编译graph
         return graph.compile()
 
+    async def run_research_task_legacy(
+        self,
+        research_topic: str,
+        research_goal: str,
+        dataset_path: str,
+        benchmark_name: str = "mlebench",
+        dataset_name: str = "unknown",
+        debug: bool = False
+    ) -> Dict[str, str]:
+        """
+        【LEGACY版本】主入口函数，执行研究任务
+        保留作为备份，待LangGraph版本稳定后删除
+
+        Args:
+            research_topic: 研究主题描述
+            research_goal: 研究目标
+            dataset_path: 数据集路径
+            benchmark_name: benchmark名称
+            dataset_name: 数据集名称
+            debug: 是否开启调试模式
+
+        Returns:
+            Dict包含任务执行结果
+        """
+        # 创建工作目录
+        workspace_dir = self._create_workspace(benchmark_name, dataset_name)
+        
+        self.logger.info("开始执行研究任务")
+        self.logger.info(f"研究主题: {research_topic}")
+        self.logger.info(f"研究目标: {research_goal}")
+        self.logger.info(f"数据集路径: {dataset_path}")
+        self.logger.info(f"工作目录: {workspace_dir}")
+        
+        try:
+            # 首先探测文件结构
+            structure_info = await self.file_structure_probing(dataset_path)
+            self.logger.info(f"文件结构分析完成: {structure_info['status']}")
+            
+            # 生成数据加载代码
+            data_loader_result = await self._generate_data_loader(
+                structure_info, dataset_path, workspace_dir
+            )
+            self.logger.info(f"数据加载代码生成: {data_loader_result['status']}")
+            
+            # 执行数据加载测试（无论debug模式如何都会执行）
+            test_result = await self._test_data_loader(workspace_dir)
+            self.logger.info(f"数据加载测试: {test_result['status']}")
+            
+            # 如果数据加载失败，尝试debug修复
+            if test_result['status'] == 'error' and test_result.get('detailed_error'):
+                self.logger.info("数据加载失败，尝试自动修复...")
+                debug_result = await self._debug_data_loader_with_retry(
+                    workspace_dir, test_result['detailed_error']
+                )
+                if debug_result['status'] == 'success':
+                    # 重新测试修复后的代码
+                    test_result = await self._test_data_loader(workspace_dir)
+                    self.logger.info(f"修复后数据加载测试: {test_result['status']}")
+            
+            # 初步分析：基于数据结构和研究任务进行分析
+            init_analysis_result = None
+            if test_result.get('data_structure_info'):
+                init_analysis_result = await self.init_analyzing(
+                    research_topic=research_topic,
+                    research_goal=research_goal,
+                    dataset_path=dataset_path,
+                    data_structure_info=test_result['data_structure_info'],
+                    structure_analysis=structure_info.get('analysis_result', {})
+                )
+                self.logger.info(f"初步分析: {init_analysis_result['status']}")
+            
+            # 生成研究代码：基于初步分析结果生成research.py
+            research_code_result = None
+            if init_analysis_result and init_analysis_result['status'] == 'success':
+                # 获取提交文件名
+                submission_file_name = self._get_submission_file_name(structure_info, benchmark_name)
+                
+                research_code_result = await self._generate_research_code(
+                    research_topic=research_topic,
+                    research_goal=research_goal,
+                    init_analysis=init_analysis_result['analysis_content'],
+                    data_structure_info=test_result['data_structure_info'],
+                    submission_file_name=submission_file_name,
+                    workspace_dir=workspace_dir
+                )
+                self.logger.info(f"研究代码生成: {research_code_result['status']}")
+                
+                # 无论生成成功与否，都要测试研究代码执行
+                if research_code_result['status'] == 'success':
+                    # 测试生成的研究代码
+                    research_test_result = await self._test_research_code(workspace_dir)
+                    self.logger.info(f"研究代码测试: {research_test_result['status']}")
+                    
+                    # 如果测试失败，启动debug循环
+                    if research_test_result['status'] == 'error' and research_test_result.get('detailed_error'):
+                        self.logger.info("研究代码执行失败，启动自动debug循环...")
+                        max_retries = 3
+                        retry_count = 0
+                        install_attempts = 0  # 依赖安装尝试次数
+                        max_install_attempts = 3
+
+                        while retry_count < max_retries and research_test_result['status'] == 'error':
+                            # 检查是否是ModuleNotFoundError
+                            error_message = research_test_result.get('detailed_error', '')
+                            is_module_error = 'ModuleNotFoundError' in error_message or 'No module named' in error_message
+
+                            if is_module_error and install_attempts < max_install_attempts:
+                                # 尝试安装缺失的包
+                                install_attempts += 1
+                                self.logger.info(f"检测到ModuleNotFoundError，尝试自动安装依赖 ({install_attempts}/{max_install_attempts})...")
+                                self.logger.error("=" * 80)
+                                self.logger.error("缺失依赖错误:")
+                                self.logger.error(error_message)
+                                self.logger.error("=" * 80)
+
+                                # 调用CodingAgent安装依赖
+                                install_result = await self.coding_agent.install_missing_package(
+                                    error_message=error_message,
+                                    project_root=str(self.workspace_root.parent)  # 项目根目录
+                                )
+
+                                if install_result['status'] == 'success':
+                                    self.logger.info(f"成功安装: {install_result.get('package_name')}")
+                                    # 直接重新测试，不计入debug次数
+                                    research_test_result = await self._test_research_code(workspace_dir)
+                                    self.logger.info(f"安装依赖后重新测试: {research_test_result['status']}")
+
+                                    if research_test_result['status'] == 'success':
+                                        self.logger.info("安装依赖后代码执行成功！")
+                                        break
+                                else:
+                                    self.logger.error(f"依赖安装失败: {install_result.get('error')}")
+                                    # 如果达到最大安装尝试次数，进入正常debug流程
+                                    if install_attempts >= max_install_attempts:
+                                        self.logger.error(f"已达到最大依赖安装尝试次数({max_install_attempts})，进入代码调试流程")
+
+                            # 不是依赖问题或已经尝试安装多次，进入正常debug流程
+                            if not is_module_error or install_attempts >= max_install_attempts:
+                                retry_count += 1
+                                self.logger.info(f"Debug尝试 {retry_count}/{max_retries}...")
+                                # 打印详细的错误信息
+                                self.logger.error("=" * 80)
+                                self.logger.error("错误详情:")
+                                self.logger.error(error_message)
+                                self.logger.error("=" * 80)
+
+                                debug_result = await self._debug_research_code_with_retry(
+                                    workspace_dir, research_test_result['detailed_error']
+                                )
+
+                                if debug_result['status'] == 'success':
+                                    # 重新测试修复后的代码
+                                    research_test_result = await self._test_research_code(workspace_dir)
+                                    self.logger.info(f"修复后研究代码测试: {research_test_result['status']}")
+
+                                    if research_test_result['status'] == 'success':
+                                        self.logger.info("研究代码debug成功，代码可正常运行")
+                                        break
+                                else:
+                                    self.logger.error(f"Debug失败: {debug_result.get('message', '')}")
+
+                        if research_test_result['status'] == 'error':
+                            self.logger.error(f"经过{max_retries}次debug尝试和{install_attempts}次依赖安装后，研究代码仍然失败")
+
+                    # 如果小样本测试成功，运行完整数据集
+                    full_run_result = None
+                    if research_test_result['status'] == 'success':
+                        self.logger.info("=" * 80)
+                        self.logger.info("小样本测试通过，开始运行完整数据集...")
+                        self.logger.info("=" * 80)
+                        full_run_result = await self._run_full_research_code(workspace_dir)
+                        self.logger.info(f"完整数据集运行: {full_run_result['status']}")
+
+                        if full_run_result['status'] == 'success':
+                            self.logger.info("完整数据集训练成功！")
+                            self.logger.info(f"生成的submission文件: {full_run_result.get('submission_files', [])}")
+
+                            # 评估结果
+                            evaluation_result = await self._evaluate_submission(
+                                workspace_dir,
+                                dataset_name,
+                                benchmark_name
+                            )
+                            full_run_result['evaluation'] = evaluation_result
+
+                            if evaluation_result['status'] == 'success':
+                                self.logger.info("=" * 80)
+                                self.logger.info("=== 评估结果 ===")
+                                self.logger.info(f"分数: {evaluation_result.get('score', 'N/A')}")
+                                self.logger.info(f"金牌: {'是' if evaluation_result.get('gold_medal') else '否'}")
+                                self.logger.info(f"银牌: {'是' if evaluation_result.get('silver_medal') else '否'}")
+                                self.logger.info(f"铜牌: {'是' if evaluation_result.get('bronze_medal') else '否'}")
+                                self.logger.info(f"超过中位数: {'是' if evaluation_result.get('above_median') else '否'}")
+                                self.logger.info(f"提交有效: {'是' if evaluation_result.get('valid_submission') else '否'}")
+                                self.logger.info(evaluation_result.get('message', ''))
+                                self.logger.info("=" * 80)
+                            else:
+                                self.logger.error("=" * 80)
+                                self.logger.error("=== 评估失败 ===")
+                                self.logger.error(f"错误: {evaluation_result.get('error_message', 'unknown')}")
+                                self.logger.error(f"失败类型: {evaluation_result.get('failure_type', 'unknown')}")
+                                self.logger.error("=" * 80)
+
+                                # 智能重试逻辑
+                                max_retry_attempts = 3  # 最多重试3次（包括重新生成和重新评估）
+                                retry_count = 0
+                                regeneration_count = 0
+
+                                while retry_count < max_retry_attempts and evaluation_result['status'] == 'error':
+                                    retry_count += 1
+                                    requires_regeneration = evaluation_result.get('requires_code_regeneration', False)
+
+                                    self.logger.info(f"DEBUG: evaluation_result keys: {evaluation_result.keys()}")
+                                    self.logger.info(f"DEBUG: requires_code_regeneration = {requires_regeneration}")
+                                    self.logger.info(f"DEBUG: failure_type = {evaluation_result.get('failure_type')}")
+
+                                    if requires_regeneration:
+                                        # 需要重新生成代码
+                                        regeneration_count += 1
+                                        self.logger.info("=" * 80)
+                                        self.logger.info(f"=== 第 {regeneration_count} 次重新生成research.py（原因：{evaluation_result.get('failure_type')}）===")
+                                        self.logger.info("=" * 80)
+
+                                        # 完全重新生成research.py
+                                        research_code_result = await self._generate_research_code(
+                                            research_topic=research_topic,
+                                            research_goal=research_goal,
+                                            init_analysis=init_analysis_result['analysis_content'],
+                                            data_structure_info=test_result['data_structure_info'],
+                                            submission_file_name=submission_file_name,
+                                            workspace_dir=workspace_dir
+                                        )
+
+                                        if research_code_result['status'] == 'success':
+                                            # 测试新代码
+                                            research_test_result = await self._test_research_code(workspace_dir)
+
+                                            if research_test_result['status'] == 'success':
+                                                # 运行完整数据集
+                                                full_run_result = await self._run_full_research_code(workspace_dir)
+
+                                                if full_run_result['status'] == 'success':
+                                                    # 重新评估
+                                                    evaluation_result = await self._evaluate_submission(
+                                                        workspace_dir,
+                                                        dataset_name,
+                                                        benchmark_name
+                                                    )
+                                                    full_run_result['evaluation'] = evaluation_result
+
+                                                    if evaluation_result['status'] == 'success':
+                                                        self.logger.info("=" * 80)
+                                                        self.logger.info(f"=== 第 {regeneration_count} 次重新生成后评估成功 ===")
+                                                        self.logger.info(f"分数: {evaluation_result.get('score', 'N/A')}")
+                                                        self.logger.info(evaluation_result.get('message', ''))
+                                                        self.logger.info("=" * 80)
+                                                        break
+                                                    else:
+                                                        self.logger.error(f"第 {regeneration_count} 次重新生成后评估仍然失败")
+                                                else:
+                                                    self.logger.error(f"第 {regeneration_count} 次重新生成的代码完整运行失败")
+                                                    break
+                                            else:
+                                                self.logger.error(f"第 {regeneration_count} 次重新生成的代码测试失败")
+                                                break
+                                        else:
+                                            self.logger.error(f"第 {regeneration_count} 次重新生成research.py失败")
+                                            break
+                                    else:
+                                        # 不需要重新生成代码，只需重新评估（可能是临时问题或文件查找问题）
+                                        self.logger.info("=" * 80)
+                                        self.logger.info(f"=== 第 {retry_count} 次重新评估（不重新生成代码）===")
+                                        self.logger.info("=" * 80)
+
+                                        evaluation_result = await self._evaluate_submission(
+                                            workspace_dir,
+                                            dataset_name,
+                                            benchmark_name
+                                        )
+                                        full_run_result['evaluation'] = evaluation_result
+
+                                        if evaluation_result['status'] == 'success':
+                                            self.logger.info("=" * 80)
+                                            self.logger.info(f"=== 重新评估成功 ===")
+                                            self.logger.info(f"分数: {evaluation_result.get('score', 'N/A')}")
+                                            self.logger.info(evaluation_result.get('message', ''))
+                                            self.logger.info("=" * 80)
+                                            break
+                                        else:
+                                            self.logger.error(f"重新评估仍然失败")
+                                            # 如果重新评估还是失败且仍然不需要重新生成，可能是其他问题
+                                            if not evaluation_result.get('requires_code_regeneration', False):
+                                                self.logger.error("评估器持续失败且不需要重新生成代码，可能是配置或环境问题")
+                                                break
+
+                                if retry_count >= max_retry_attempts and evaluation_result['status'] == 'error':
+                                    self.logger.error(f"已达到最大重试次数 ({max_retry_attempts})，评估仍然失败")
+
+                                # 更新research_code_result以包含重试信息
+                                research_code_result['regeneration_count'] = regeneration_count
+                                research_code_result['total_retry_count'] = retry_count
+                        else:
+                            # 完整数据集运行失败，启动重试循环
+                            self.logger.error(f"完整数据集运行失败: {full_run_result.get('message', '')}")
+
+                            max_full_run_retries = 3
+                            full_run_retry_count = 0
+                            full_regeneration_count = 0
+
+                            while full_run_retry_count < max_full_run_retries and full_run_result['status'] == 'error':
+                                full_run_retry_count += 1
+                                full_regeneration_count += 1
+
+                                # 分析失败原因
+                                failure_message = full_run_result.get('message', '')
+                                error_output = full_run_result.get('stderr', '') + '\n' + full_run_result.get('stdout', '')
+
+                                # 构建优化提示
+                                optimization_hint = ""
+                                if '超时' in failure_message or 'timeout' in failure_message.lower():
+                                    optimization_hint = """
+代码执行超时（2小时限制）。请优化代码以提高运行速度：
+1. 减少特征数量（如TF-IDF的max_features从5000降到1000-2000）
+2. 使用更简单的模型（如LogisticRegression而非复杂的集成模型）
+3. 减少训练数据量（如使用stratified sampling取子集）
+4. 移除耗时的特征工程步骤
+5. 避免使用循环遍历数据，使用向量化操作
+6. 确保使用n_jobs=-1等并行参数加速训练
+"""
+                                elif 'memory' in failure_message.lower() or 'oom' in failure_message.lower():
+                                    optimization_hint = """
+内存不足错误。请优化内存使用：
+1. 减少TF-IDF特征数量（max_features降低到1000以下）
+2. 使用sparse matrix而非dense matrix
+3. 分批处理数据而非一次性加载
+4. 使用内存高效的模型（LinearSVC, SGDClassifier等）
+5. 及时释放不需要的中间变量
+"""
+                                else:
+                                    optimization_hint = f"""
+完整数据集运行失败，错误信息：
+{error_output[-1000:] if len(error_output) > 1000 else error_output}
+
+请分析错误并优化代码，确保能在2小时内完成训练。
+"""
+
+                                self.logger.info("=" * 80)
+                                self.logger.info(f"=== 第 {full_regeneration_count} 次重新生成research.py（完整数据集运行失败）===")
+                                self.logger.info(f"失败原因: {failure_message}")
+                                self.logger.info("=" * 80)
+
+                                # 重新生成代码，带上优化提示
+                                optimized_init_analysis = init_analysis_result['analysis_content'] + "\n\n**重要优化要求**：" + optimization_hint
+
+                                research_code_result = await self._generate_research_code(
+                                    research_topic=research_topic,
+                                    research_goal=research_goal,
+                                    init_analysis=optimized_init_analysis,
+                                    data_structure_info=test_result['data_structure_info'],
+                                    submission_file_name=submission_file_name,
+                                    workspace_dir=workspace_dir
+                                )
+
+                                if research_code_result['status'] == 'success':
+                                    # 测试新代码
+                                    research_test_result = await self._test_research_code(workspace_dir)
+
+                                    if research_test_result['status'] == 'success':
+                                        # 重新运行完整数据集
+                                        full_run_result = await self._run_full_research_code(workspace_dir)
+
+                                        if full_run_result['status'] == 'success':
+                                            self.logger.info("=" * 80)
+                                            self.logger.info(f"=== 第 {full_regeneration_count} 次优化后完整运行成功 ===")
+                                            self.logger.info("=" * 80)
+
+                                            # 评估结果
+                                            evaluation_result = await self._evaluate_submission(
+                                                workspace_dir,
+                                                dataset_name,
+                                                benchmark_name
+                                            )
+                                            full_run_result['evaluation'] = evaluation_result
+
+                                            if evaluation_result['status'] == 'success':
+                                                self.logger.info("=" * 80)
+                                                self.logger.info("=== 评估结果 ===")
+                                                self.logger.info(f"分数: {evaluation_result.get('score', 'N/A')}")
+                                                self.logger.info(f"金牌: {'是' if evaluation_result.get('gold_medal') else '否'}")
+                                                self.logger.info(f"银牌: {'是' if evaluation_result.get('silver_medal') else '否'}")
+                                                self.logger.info(f"铜牌: {'是' if evaluation_result.get('bronze_medal') else '否'}")
+                                                self.logger.info(f"超过中位数: {'是' if evaluation_result.get('above_median') else '否'}")
+                                                self.logger.info(f"提交有效: {'是' if evaluation_result.get('valid_submission') else '否'}")
+                                                self.logger.info(evaluation_result.get('message', ''))
+                                                self.logger.info("=" * 80)
+                                            break
+                                        else:
+                                            self.logger.error(f"第 {full_regeneration_count} 次优化后完整运行仍然失败: {full_run_result.get('message', '')}")
+                                    else:
+                                        self.logger.error(f"第 {full_regeneration_count} 次优化后的代码测试失败")
+                                        # 测试失败也要继续重试，不要break
+                                else:
+                                    self.logger.error(f"第 {full_regeneration_count} 次重新生成research.py失败")
+                                    break
+
+                            if full_run_retry_count >= max_full_run_retries and full_run_result['status'] == 'error':
+                                self.logger.error(f"已达到最大完整运行重试次数 ({max_full_run_retries})，完整运行仍然失败")
+
+                    # 更新research_code_result以包含测试结果和完整运行结果
+                    research_code_result['test_result'] = research_test_result
+                    research_code_result['full_run_result'] = full_run_result
+                    if research_test_result['status'] == 'success':
+                        if full_run_result and full_run_result['status'] == 'success':
+                            research_code_result['status'] = 'success'
+                            research_code_result['message'] = '研究代码生成、测试和完整运行全部成功'
+                        else:
+                            research_code_result['status'] = 'partial_success'
+                            research_code_result['message'] = '研究代码测试成功但完整运行失败'
+                    else:
+                        research_code_result['status'] = 'error'
+                        research_code_result['message'] = '研究代码生成成功但执行失败'
+            
+            return {
+                "status": "success",
+                "workspace_dir": str(workspace_dir),
+                "research_topic": research_topic,
+                "research_goal": research_goal,
+                "dataset_path": dataset_path,
+                "structure_info": structure_info,
+                "data_loader_result": data_loader_result,
+                "test_result": test_result,  # 替换debug_result
+                "init_analysis_result": init_analysis_result,  # 新增初步分析结果
+                "research_code_result": research_code_result,  # 新增研究代码结果
+                "message": "研究任务启动成功"
+            }
+            
+        except Exception as e:
+            self.logger.error(f"研究任务执行失败: {str(e)}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "message": f"研究任务执行失败: {str(e)}"
+            }
+    
     async def file_structure_probing(self, dataset_path: str) -> Dict[str, str]:
         """
         文件结构探测，分析数据集结构并判断文件加载需求
@@ -1161,76 +1605,6 @@ class InterAgent:
                 "message": f"生成研究代码失败: {str(e)}"
             }
     
-    def _execute_research_code(
-        self,
-        workspace_dir: Path,
-        timeout: int,
-        use_small_sample: bool = False
-    ) -> subprocess.CompletedProcess:
-        """执行research.py代码
-
-        Args:
-            workspace_dir: 工作目录
-            timeout: 超时时间（秒）
-            use_small_sample: 是否使用小样本模式
-
-        Returns:
-            subprocess.CompletedProcess对象
-        """
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-
-        if use_small_sample:
-            env["USE_SMALL_SAMPLE"] = "1"
-            env["QUICK_TEST"] = "1"
-        else:
-            # 完整运行时，移除小样本环境变量
-            env.pop("USE_SMALL_SAMPLE", None)
-            env.pop("QUICK_TEST", None)
-
-        result = subprocess.run(
-            ["python", "-u", "research.py"],
-            cwd=str(workspace_dir),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env
-        )
-
-        return result
-
-    def _validate_csv_files(self, workspace_dir: Path) -> tuple:
-        """验证workspace中的CSV文件
-
-        Args:
-            workspace_dir: 工作目录
-
-        Returns:
-            (valid_files, all_files): 有效文件列表和所有文件列表
-        """
-        import pandas as pd
-
-        submission_files = list(workspace_dir.glob("*.csv"))
-        valid_files = []
-
-        for csv_file in submission_files:
-            try:
-                df = pd.read_csv(csv_file)
-                # 检查文件不是空的，且有实际数据行
-                if len(df) > 0 and not df.empty:
-                    # 检查是否至少有1列数据
-                    if len(df.columns) >= 1:
-                        valid_files.append(csv_file)
-                        self.logger.info(f"有效submission文件: {csv_file.name}, 形状: {df.shape}")
-                    else:
-                        self.logger.warning(f"submission文件列数不足: {csv_file.name}")
-                else:
-                    self.logger.warning(f"submission文件为空: {csv_file.name}")
-            except Exception as e:
-                self.logger.warning(f"无法读取submission文件 {csv_file.name}: {e}")
-
-        return valid_files, submission_files
-
     def _find_and_validate_output_files(self, workspace_dir: Path, benchmark_name: str = "mlebench") -> tuple:
         """
         查找并验证输出文件

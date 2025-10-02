@@ -13,7 +13,7 @@ async def main():
 
     benchmark_name="mlebench"
     # 测试用的数据集名称
-    dataset_name = "aerial-cactus-identification"
+    dataset_name = "text-normalization-challenge-russian-language"
     # "jigsaw-toxic-comment-classification-challenge"
     # "denoising-dirty-documents"
     # "leaf-classification"
