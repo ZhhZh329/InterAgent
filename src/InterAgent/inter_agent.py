@@ -226,6 +226,7 @@ class InterAgent:
         full_run_result = state['full_run_result'].copy()
         full_run_result['evaluation'] = evaluation_result
 
+        # 实时输出评估结果，方便用户查看执行进度
         if evaluation_result['status'] == 'success':
             self.logger.info("=" * 80)
             self.logger.info("=== 评估结果 ===")
@@ -434,7 +435,7 @@ class InterAgent:
             messages = [{"role": "user", "content": prompt}]
             response = await self.client.chat(messages, max_tokens=2000)
             
-            # 调试：记录LLM响应
+            # 实时输出LLM响应，方便查看执行进度
             self.logger.info(f"LLM文件结构分析响应: {response}")
             
             # 解析LLM响应
@@ -992,6 +993,7 @@ class InterAgent:
                         )
                         full_run_result['evaluation'] = evaluation_result
 
+                        # 实时输出评估结果
                         if evaluation_result['status'] == 'success':
                             self.logger.info("=" * 80)
                             self.logger.info("=== 评估结果 ===")
